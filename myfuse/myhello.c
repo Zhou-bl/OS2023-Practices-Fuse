@@ -8,7 +8,12 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>
 //#include <ctime.h>
+
+/*
+* Compiler with: gcc -Wall myhello.c `pkg-config fuse3 --cflags --libs` -o myhello
+*/
 
 #define FUSE_SUPER_MAGIC 0x65735546
 #define BLOCKSIZE (1024UL * 4)
@@ -95,6 +100,7 @@ static struct memfs_file *__create_node(const char *path, mode_t mode, int is_di
     pf -> vstat.st_atime = time(NULL);
     pf -> vstat.st_mtime = time(NULL);
     pf -> vstat.st_ctime = time(NULL);
+
     //printf("Hello, finish create node\n");
 
     //node_array_size++;
@@ -213,6 +219,62 @@ static void __update_time(struct memfs_file *pf){
     }
 }
 
+static int __check_permission(const char *path, int rwx_flag){//rwx: 0(r), 1(w), 2(x)
+    //rwxrwxrwx
+    struct memfs_file *pf = __search(path);
+    uid_t cur_uid = getuid();
+    uid_t cur_gid = getgid();
+    mode_t mode = 0;
+    if(cur_uid == pf -> vstat.st_uid){
+        //文件的所有者，享有第一个rwx权限
+        mode = (pf -> vstat.st_mode >> 6) & 7;
+        if(rwx_flag == 0){
+            //检查是否有r权限：
+            return mode & 4;
+        }
+        else if(rwx_flag == 1){
+            //检查是否有w权限：
+            return mode & 2;
+        }
+        else{
+            //检查是否有x权限：
+            return mode & 1;
+        }
+    }
+    else if(cur_gid == pf -> vstat.st_gid){
+        //文件的所属组，享有第二个rwx权限
+        mode = (pf -> vstat.st_mode >> 3) & 7;
+        if(rwx_flag == 0){
+            //检查是否有r权限：
+            return mode & 4;
+        }
+        else if(rwx_flag == 1){
+            //检查是否有w权限：
+            return mode & 2;
+        }
+        else{
+            //检查是否有x权限：
+            return mode & 1;
+        }
+    }
+    else{
+        //其他用户，享有第三个rwx权限
+        mode = pf -> vstat.st_mode & 7;
+        if(rwx_flag == 0){
+            //检查是否有r权限：
+            return mode & 4;
+        }
+        else if(rwx_flag == 1){
+            //检查是否有w权限：
+            return mode & 2;
+        }
+        else{
+            //检查是否有x权限：
+            return mode & 1;
+        }
+    }
+}
+
 static int memfs_statfs(const char *path, struct statvfs *stbuf){
     fprintf(fp,"%s: %s\n", __FUNCTION__, path);
     *stbuf = memfs.statvfs;
@@ -250,6 +312,9 @@ static int memfs_access(const char *path, int mask){
     if(!pf){
         res = -ENOENT;
     }
+    if(!__check_permission(path, 0)){
+        res = -EACCES;
+    }
     //pthread_mutex_unlock(&memfs.lock);
     return res;
 }
@@ -275,6 +340,11 @@ static int memfs_mkdir(const char *path, mode_t mode){
         parent_path = "/";
     }
     struct memfs_file *par = __search(parent_path);
+
+    if(!__check_permission(parent_path, 1)){
+        return -EACCES;
+    }
+
     pf = __create_node(path, mode, 1, par);
     fprintf(fp, "Hello, finish create node\n");
     res = __insert(pf);
@@ -289,6 +359,17 @@ static int memfs_rmdir(const char *path){
     int res = 0;
     //printf("%s: %s\n", __FUNCTION__, path);
     //pthread_mutex_lock(&memfs.lock);
+
+    //父目录：
+    char *parent_path = getSubstringBeforeLastSlash(path);
+    if(strcmp(parent_path, "") == 0){
+        parent_path = "/";
+    }
+
+    if(!__check_permission(parent_path, 1)){
+        return -EACCES;
+    }
+
     if(__delete(path) == -ENOENT){
         res = -ENOENT;
     }
@@ -331,6 +412,9 @@ static int memfs_mknod(const char *path, mode_t mode, dev_t rdev){
     if(strcmp(parent_path, "") == 0){
         parent_path = "/";
     }
+    if(!__check_permission(parent_path, 1)){
+        return -EACCES;
+    }
     par = __search(parent_path);
     pf = __create_node(path, mode, 0, par);
     __insert(pf);
@@ -344,6 +428,14 @@ static int memfs_utimes(const char *path, const struct timespec tv[2], struct fu
 
 static int memfs_unlink(const char *path){
     fprintf(fp,"%s: %s\n", __FUNCTION__, path);
+    //检查所在目录是否有权限：
+    char *parent_path = getSubstringBeforeLastSlash(path);
+    if(strcmp(parent_path, "") == 0){
+        parent_path = "/";
+    }
+    if(!__check_permission(parent_path, 1)){
+        return -EACCES;
+    }
     //删除结点
     int res = __delete(path);
     return res;
@@ -353,6 +445,10 @@ static int memfs_open(const char *path, struct fuse_file_info *fi){
     fprintf(fp,"%s: %s\n", __FUNCTION__, path);
     //打开文件
     (void) fi;
+    //检查权限:
+    if(!__check_permission(path, 0)){
+        return -EACCES;
+    }
     struct memfs_file *pf = __search(path);
     if(!pf){
         return -ENOENT;
@@ -373,6 +469,10 @@ static int memfs_read(const char *path, char *buf, size_t size, off_t offset, st
     fprintf(fp,"%s: %s\n", __FUNCTION__, path);
     //读文件
     (void) fi;
+    //检查权限:
+    if(!__check_permission(path, 0)){
+        return -EACCES;
+    }
     struct memfs_file *pf = __search(path);
     if(!pf){
         return -ENOENT;
@@ -387,6 +487,7 @@ static int memfs_read(const char *path, char *buf, size_t size, off_t offset, st
         size = pf->vstat.st_size - offset;
     }
     memcpy(buf, pf->data + offset, size);
+    pf -> vstat.st_atime = time(NULL);
     return size;
 }
 
@@ -394,6 +495,10 @@ static int memfs_write(const char *path, const char *buf, size_t size, off_t off
     fprintf(fp,"%s: %s\n", __FUNCTION__, path);
     //写文件
     (void) fi;
+    //检查权限:
+    if(!__check_permission(path, 1)){
+        return -EACCES;
+    }
     struct memfs_file *pf = __search(path);
     if(!pf){
         return -ENOENT;
@@ -409,6 +514,24 @@ static int memfs_write(const char *path, const char *buf, size_t size, off_t off
     memcpy(pf->data + offset, buf, size);
     __update_time(pf);
     return size;
+}
+
+static int memfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi){
+    fprintf(fp,"%s: %s\n", __FUNCTION__, path);
+    //修改文件权限
+    (void) fi;
+    
+    //必须是文件的所有者或者root用户
+    if(getuid() != 0 && getuid() != __search(path)->vstat.st_uid){
+        return -EACCES;
+    }
+    struct memfs_file *pf = __search(path);
+    if(!pf){
+        return -ENOENT;
+    }
+    pf -> vstat.st_mode = mode | (pf->is_dir ? S_IFDIR : S_IFREG);
+    pf -> vstat.st_ctime = time(NULL);
+    return 0;
 }
 
 static struct fuse_operations memfs_oper = {
@@ -432,6 +555,7 @@ static struct fuse_operations memfs_oper = {
     .rmdir   = memfs_rmdir,
 
     .statfs  = memfs_statfs,
+    .chmod   = memfs_chmod,
 };
 
 /*
@@ -442,6 +566,10 @@ static struct fuse_operations memfs_oper = {
 * rmdir: rmdir
 * touch: mknod, utimens
 * rm: unlink
+* cat: open, read
+* echo: open, write
+* stat: statfs
+* chmod: chmod
 */
 
 void init_array(){
